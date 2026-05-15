@@ -46,6 +46,9 @@ def node_analyze(state):
                 "Senior reviewer. Structured output. "
                 # TODO: add an instruction: if confidence < 60%, populate escalation_questions
                 # with 2–4 specific, context-rich questions (reference which file/section in the diff).
+                "If your confidence is low (e.g. < 0.70), you MUST populate 'escalation_questions' "
+                "with 2-4 specific, context-rich questions for the human reviewer to answer. "
+                "Reference specific files or sections in the diff where you need clarification."
             )},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
@@ -75,7 +78,19 @@ def node_escalate(state: ReviewState) -> dict:
     #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
     # answers = interrupt({...})
     # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    payload = {
+        "kind": "escalation",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "questions": questions,
+    }
+    
+    answers = interrupt(payload)
+    
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
@@ -86,7 +101,34 @@ def node_synthesize(state: ReviewState) -> dict:
     #     containing the original diff + initial analysis + Q&A.
     #   - return {"analysis": refined}
     # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    answers = state.get("escalation_answers", {})
+    qa_str = "\n".join([f"Q: {q}\nA: {ans}" for q, ans in answers.items()])
+    
+    llm = get_llm().with_structured_output(PRAnalysis)
+    
+    prompt = f"""You are a senior reviewer. You previously analyzed a PR but had some uncertainties.
+    The human reviewer has now provided answers to your questions.
+    
+    PR Title: {state['pr_title']}
+    Original Diff:
+    {state['pr_diff']}
+    
+    Initial Analysis Summary: {state['analysis'].summary}
+    
+    Reviewer Answers:
+    {qa_str}
+    
+    Based on this new information, provide a REFINED and FINAL PRAnalysis.
+    Your confidence should be higher now that your questions have been answered.
+    """
+    
+    with console.status("[dim]LLM synthesizing answers...[/dim]"):
+        refined = llm.invoke([
+            ("system", "You are a senior reviewer synthesizing human feedback."),
+            ("user", prompt)
+        ])
+    
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -162,6 +204,8 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     # TODO: wire escalate → synthesize → commit  (commit already → END)
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=MemorySaver())
 
 
